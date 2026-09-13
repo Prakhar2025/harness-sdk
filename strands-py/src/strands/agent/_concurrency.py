@@ -127,6 +127,11 @@ class _ConcurrencyController:
         if self._mode == ConcurrentInvocationMode.THROW:
             lock_acquired = self._invocation_lock.acquire(blocking=False)
 
+        if lock_acquired:
+            # Count the invocation inside begin() so cancel() cannot observe a gap
+            # between admission and an active count above zero.
+            self.mark_started()
+
         return _BeginResult(waiting_on=None, registered_token=registered_token, lock_acquired=lock_acquired)
 
     def complete(
@@ -169,7 +174,7 @@ class _ConcurrencyController:
     def mark_started(self) -> None:
         """Record that an invocation has begun.
 
-        Called once per accepted invocation, after ``begin`` returns a proceed result.
+        Called by :meth:`begin` once the invocation is admitted.
         """
         with self._inflight_lock:
             self._active_invocations += 1

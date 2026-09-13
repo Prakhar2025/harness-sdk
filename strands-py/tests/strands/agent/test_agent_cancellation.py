@@ -20,11 +20,8 @@ DEFAULT_RESPONSE = {
 
 @pytest.mark.asyncio
 async def test_agent_cancel_on_idle_agent_is_noop():
-    """Regression test for issue #2156: cancel() on an idle agent must be a no-op.
-
-    Calling cancel() while no invocation is running used to set the cancel signal, so the
-    NEXT invocation was cancelled before making any model calls. cancel() is now ignored
-    while the agent is idle, and the next invocation runs to completion.
+    """Regression test for issue #2156: cancelling while the agent is idle must not
+    affect the next invocation, which runs to completion.
     """
     agent = Agent(model=MockedModelProvider([DEFAULT_RESPONSE]))
 
@@ -325,16 +322,19 @@ async def test_agent_cancel_continue_after():
 
 @pytest.mark.asyncio
 async def test_cancel_during_concurrent_reentrant_invocations():
-    """A concurrent invocation finishing does not clear the cancellation of one still running.
+    """Cancelling during concurrent reentrant invocations cancels all of them, and only
+    the last teardown clears the shared cancel signal.
 
-    In UNSAFE_REENTRANT mode both invocations share the cancel signal, so only the last
-    teardown may clear it.
+    In UNSAFE_REENTRANT mode invocations share the cancel signal: an invocation finishing
+    while another is still running must not discard the pending cancellation.
     """
 
-    streaming_started = asyncio.Event()
-    cancel_ready = asyncio.Event()
+    first_started = asyncio.Event()
+    second_started = asyncio.Event()
+    release_first = asyncio.Event()
+    release_second = asyncio.Event()
 
-    class FirstCallBlocksProvider(MockedModelProvider):
+    class BlockingProvider(MockedModelProvider):
         def __init__(self, responses):
             super().__init__(responses)
             self._calls = 0
@@ -342,28 +342,34 @@ async def test_cancel_during_concurrent_reentrant_invocations():
         async def stream(self, *args, **kwargs):
             self._calls += 1
             if self._calls == 1:
-                streaming_started.set()
-                await cancel_ready.wait()
+                first_started.set()
+                await release_first.wait()
+            elif self._calls == 2:
+                second_started.set()
+                await release_second.wait()
             async for event in super().stream(*args, **kwargs):
                 yield event
 
     agent = Agent(
-        model=FirstCallBlocksProvider([DEFAULT_RESPONSE, DEFAULT_RESPONSE, DEFAULT_RESPONSE]),
+        model=BlockingProvider([DEFAULT_RESPONSE, DEFAULT_RESPONSE, DEFAULT_RESPONSE]),
         concurrent_invocation_mode=ConcurrentInvocationMode.UNSAFE_REENTRANT,
     )
 
     first = asyncio.create_task(agent.invoke_async("First"))
-    await streaming_started.wait()
-
-    second = await agent.invoke_async("Second")
-    assert second.stop_reason == "end_turn"
+    await first_started.wait()
+    second = asyncio.create_task(agent.invoke_async("Second"))
+    await second_started.wait()
 
     agent.cancel()
-    cancel_ready.set()
-    first_result = await first
-    assert first_result.stop_reason == "cancelled"
+    release_second.set()
+    assert (await second).stop_reason == "cancelled"
 
-    # The surviving teardown clears the signal, so the agent stays reusable.
+    # The first invocation must still observe the cancellation even though the second
+    # invocation finished after it was requested.
+    release_first.set()
+    assert (await first).stop_reason == "cancelled"
+
+    # The last teardown clears the signal, so the agent stays reusable.
     assert not agent.cancel_signal.is_set()
     third = await agent.invoke_async("Third")
     assert third.stop_reason == "end_turn"
